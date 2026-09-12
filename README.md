@@ -145,9 +145,11 @@ upload/download moments**, not one — worth knowing going in:
    — no chat data in it yet.
 3. **Runtime → Change runtime type → T4 GPU**, then run the cells in
    order. The second cell pops a file-upload widget *inside the notebook*
-   — that's where you drag in `train.jsonl` and `valid.jsonl` from
-   `data/processed/<persona>/` on your Mac. This is the only point your
-   data leaves your machine.
+   — that's where you drag in `train.jsonl` and `valid.jsonl`. You don't
+   create these yourself: they're written automatically to
+   `data/processed/<persona>/` the moment you upload that person's chat
+   export in the app (step 1, "Prepare data") — just go find them in
+   Finder. This upload is the only point your data leaves your machine.
 4. Training runs in Colab. The last data-producing cell merges the LoRA
    into the base model and **downloads `merged_model.zip`** back to your
    Mac (your Downloads folder) — a full model, not a bare adapter, so
