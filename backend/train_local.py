@@ -1,221 +1,228 @@
 """
-Wraps `mlx_lm.lora` to LoRA fine-tune a local base model on one persona's
-prepared data, then keeps the best-val checkpoint (mlx_lm itself only saves
-periodic + final checkpoints — it doesn't pick a winner, and the final one
-is whatever iteration training happened to stop on, which past experience
-on this project says is often already past the point where it started
-overfitting).
+Local LoRA training for one persona.
+
+1. Rebuilds train/valid.jsonl with the selected model's tokenizer, so
+   example lengths are measured with the template that will actually be used.
+2. Runs lora_train.py in a subprocess (frees all GPU memory when it exits)
+   and relays its progress.
+3. Trains into a staging directory and swaps it in only on success, so a
+   failed retrain never leaves a half-written persona behind.
 
 Usage:
-    python train_local.py --persona hudson --data_dir ../data/processed/hudson \
-        --adapter_dir ../models/adapters/hudson
+    python train_local.py --name hudson --model qwen-3b
 """
 import argparse
 import json
+import math
 import re
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 
-import yaml
+import prepare_data
+from generation import resolve_settings
+
+BACKEND_DIR = Path(__file__).resolve().parent
+EVENT_PREFIX = "@@personabot "
+MLX_PROGRESS_RE = re.compile(r"^(Iter \d+: |Calculating loss)")
 
 MODELS = {
-    # key -> (repo, tier). tier drives batch/num_layers/grad_checkpoint
-    # defaults below — "small" fits comfortably on 16GB with headroom,
-    # "large" needs grad checkpointing to stay under budget.
-    "qwen-3b": ("mlx-community/Qwen2.5-3B-Instruct-4bit", "small"),
-    "qwen-7b": ("mlx-community/Qwen2.5-7B-Instruct-4bit", "large"),
-    "llama-3b": ("mlx-community/Llama-3.2-3B-Instruct-4bit", "small"),
-    "llama-8b": ("mlx-community/Meta-Llama-3.1-8B-Instruct-4bit", "large"),
+    # tier drives batch size / gradient checkpointing (16 GB unified memory).
+    # "unsloth" is the matching 4-bit CUDA build for the Colab notebook.
+    "qwen-3b": {"repo": "mlx-community/Qwen2.5-3B-Instruct-4bit", "tier": "small",
+                "unsloth": "unsloth/Qwen2.5-3B-Instruct-bnb-4bit"},
+    "qwen-7b": {"repo": "mlx-community/Qwen2.5-7B-Instruct-4bit", "tier": "large",
+                "unsloth": "unsloth/Qwen2.5-7B-Instruct-bnb-4bit"},
+    "llama-3b": {"repo": "mlx-community/Llama-3.2-3B-Instruct-4bit", "tier": "small",
+                 "unsloth": "unsloth/Llama-3.2-3B-Instruct-bnb-4bit"},
+    "llama-8b": {"repo": "mlx-community/Meta-Llama-3.1-8B-Instruct-4bit", "tier": "large",
+                 "unsloth": "unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit"},
+    # Base (non-instruct) checkpoints: no assistant-persona tuning to fight.
+    # Qwen2.5 base ships the same chat template, so the pipeline is unchanged.
+    "qwen-3b-base": {"repo": "mlx-community/Qwen2.5-3B-4bit", "tier": "small",
+                     "unsloth": "unsloth/Qwen2.5-3B-bnb-4bit"},
+    "qwen-7b-base": {"repo": "mlx-community/Qwen2.5-7B-4bit", "tier": "large",
+                     "unsloth": "unsloth/Qwen2.5-7B-bnb-4bit"},
 }
 
-ITER_RE = re.compile(r"Iter (\d+): (Val|Train) loss ([\d.]+)")
 
-
-def pick_hparams(n_train, model_key, rank=16, num_layers=None):
-    """Small-corpus defaults.
-
-    Measured directly on this project's ~3,200-example corpus: LoRA on a
-    pretrained instruct model overfits *fast* — val loss bottomed well under
-    a tenth of a single epoch in (iter ~100 of 150, batch 2) and was already
-    climbing back by iter 150. A pretrained model already knows English and
-    conversation structure; the adapter only has to steer style, so it
-    doesn't need — and shouldn't get — many passes over a small corpus.
-    Budget under 1 epoch, with frequent eval checkpoints early on so the
-    best-val promotion in run_training() actually has a fine-grained best
-    checkpoint to find rather than 20% jumps.
-
-    rank/num_layers control adapter *capacity* (how much of the person's
-    voice it can absorb), which is a separate axis from iters/epochs (how
-    long training runs) — mlx_lm's own default is rank 8, quite low headroom
-    for shifting content/personality rather than just tone; num_layers
-    defaults to a larger fraction of the network than mlx_lm's own default
-    (16, regardless of model size) since the base model's total layer count
-    differs a lot between the "small" and "large" tiers."""
-    tier = MODELS[model_key][1]
+def pick_hparams(n_train, model_key, rank=16, num_layers=None, learning_rate=1e-5):
+    """About one epoch with warmup + cosine decay. Validation runs ~10 times;
+    early stopping and checkpoint selection handle overfitting, so the budget
+    no longer has to be cut short up front."""
+    tier = MODELS[model_key]["tier"]
     batch_size = 2 if tier == "small" else 1
-    epochs = 0.5
-    iters = max(150, min(800, round(n_train * epochs / batch_size)))
-    steps_per_eval = max(15, iters // 20)
-    if num_layers is None:
-        num_layers = 24 if tier == "small" else 16
+    grad_accum = 1 if tier == "small" else 2
+    iters = max(60, min(4000, math.ceil(n_train / batch_size)))
+    updates = max(1, iters // grad_accum)
+    warmup = max(3, updates // 20)
     return {
         "batch_size": batch_size,
+        "grad_accumulation_steps": grad_accum,
         "iters": iters,
-        "steps_per_eval": steps_per_eval,
-        "num_layers": num_layers,
+        "steps_per_eval": max(10, iters // 10),
+        "steps_per_report": max(5, iters // 40),
+        "num_layers": num_layers if num_layers is not None else (24 if tier == "small" else 16),
         "rank": rank,
         "grad_checkpoint": tier != "small",
+        "learning_rate": learning_rate,
+        "lr_schedule": {
+            "name": "cosine_decay",
+            "arguments": [learning_rate, max(1, updates - warmup), learning_rate * 0.1],
+            "warmup": warmup,
+            "warmup_init": learning_rate * 0.05,
+        },
     }
 
 
-def run_training(persona, data_dir, adapter_dir, model_key="qwen-7b", learning_rate=1e-5,
-                  max_seq_length=512, rank=16, num_layers=None, extra_hparams=None):
-    data_dir = Path(data_dir)
+def staging_dir_for(adapter_dir):
     adapter_dir = Path(adapter_dir)
-    adapter_dir.mkdir(parents=True, exist_ok=True)
+    return adapter_dir.with_name(adapter_dir.name + ".staging")
 
-    meta = json.loads((data_dir / "meta.json").read_text())
-    hp = pick_hparams(meta["n_train"], model_key, rank=rank, num_layers=num_layers)
-    if extra_hparams:
-        hp.update(extra_hparams)
 
-    # mlx_lm.lora only accepts lora_parameters (rank/scale/dropout) via a YAML
-    # -c config, not a CLI flag — write one so the adapter isn't silently
-    # stuck at mlx_lm's own default (rank 8). scale=20 is mlx_lm's default
-    # scaling of the low-rank update; kept fixed since it's tuned for that
-    # default learning-rate range, not something this project has evidence
-    # to move.
-    lora_config_path = adapter_dir / "lora_config.yaml"
-    lora_config_path.write_text(yaml.safe_dump({
-        "lora_parameters": {"rank": hp["rank"], "dropout": 0.05, "scale": 20.0},
-    }))
+def swap_in(staging, adapter_dir):
+    """Replace adapter_dir with staging, keeping the user's settings.json."""
+    staging, adapter_dir = Path(staging), Path(adapter_dir)
+    old_settings = adapter_dir / "settings.json"
+    if old_settings.exists() and not (staging / "settings.json").exists():
+        shutil.copy(old_settings, staging / "settings.json")
+    backup = adapter_dir.with_name(adapter_dir.name + ".old")
+    shutil.rmtree(backup, ignore_errors=True)
+    if adapter_dir.exists():
+        adapter_dir.rename(backup)
+    staging.rename(adapter_dir)
+    shutil.rmtree(backup, ignore_errors=True)
 
-    cmd = [
-        sys.executable, "-m", "mlx_lm", "lora",
-        "--model", MODELS[model_key][0],
-        "--train",
-        "--data", str(data_dir),
-        "--adapter-path", str(adapter_dir),
-        "--fine-tune-type", "lora",
-        "--batch-size", str(hp["batch_size"]),
-        "--iters", str(hp["iters"]),
-        "--num-layers", str(hp["num_layers"]),
-        "--learning-rate", str(learning_rate),
-        "--max-seq-length", str(max_seq_length),
-        "--steps-per-report", str(max(10, hp["steps_per_eval"] // 2)),
-        "--steps-per-eval", str(hp["steps_per_eval"]),
-        "--save-every", str(hp["steps_per_eval"]),
-        "--val-batches", "5",  # 20 spent ~28% of wall time on eval; 10 still worked fine, 5 trims further
-        "--mask-prompt",
-        "-c", str(lora_config_path),
-    ]
-    if hp["grad_checkpoint"]:
-        cmd.append("--grad-checkpoint")
 
-    print("Running:", " ".join(cmd))
-    # Early stopping: measured on this project's own corpus, LoRA on a
-    # pretrained model overfits within well under one epoch (best val at
-    # ~10% of a 150-iter test run, already rising by the end) — so running
-    # the full --iters budget routinely wastes most of the run's wall-clock
-    # time after the best checkpoint is already found. PATIENCE consecutive
-    # evals with no improvement stops the subprocess ourselves; this counts
-    # as a normal, successful stop (we already have the best-val checkpoint
-    # on disk), not an error.
-    PATIENCE = 4
-    best_iter, best_val, evals_since_best = None, float("inf"), 0
-    early_stopped = False
+def persona_meta_from(data_meta, **extra):
+    """Everything chat needs to reproduce the training-time prompt."""
+    keys = ("persona", "display_name", "me_label", "prompt_style", "context_turns",
+            "system_prompt", "reply_tokens_p95", "format_version")
+    return {**{k: data_meta.get(k) for k in keys}, **extra}
 
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    for line in proc.stdout:
-        print(line, end="")
-        m = ITER_RE.search(line)
-        if m:
-            it, kind, val = int(m.group(1)), m.group(2), float(m.group(3))
-            if val != val:  # NaN check (NaN != NaN); a bad batch has poisoned
-                proc.terminate()  # every parameter downstream — no point continuing.
-                raise RuntimeError(
-                    f"Training diverged: {kind} loss went NaN at iter {it}. "
-                    "Most likely a training example is too long for --max-seq-length "
-                    "and got its target reply truncated off (see prepare_data.py's "
-                    "length-safe trimming) — check for unusually long messages in "
-                    "the uploaded chat export."
-                )
-            if kind == "Val":
-                if val < best_val:
-                    best_val, best_iter, evals_since_best = val, it, 0
-                else:
-                    evals_since_best += 1
-                    if evals_since_best >= PATIENCE:
-                        print(
-                            f"\nEarly stopping: val loss hasn't improved on iter "
-                            f"{best_iter} (val {best_val:.3f}) for {PATIENCE} evals.",
-                            flush=True,
-                        )
-                        proc.terminate()
-                        early_stopped = True
-                        break
-    if not early_stopped:
-        proc.wait()
-        if proc.returncode != 0:
-            raise RuntimeError(f"mlx_lm.lora exited with code {proc.returncode}")
-    else:
-        proc.wait(timeout=30)
 
-    # Promote the best-val checkpoint to the adapter file mlx_lm.generate loads.
-    if best_iter is not None:
-        ckpt = adapter_dir / f"{best_iter:07d}_adapters.safetensors"
-        if ckpt.exists():
-            shutil.copy(ckpt, adapter_dir / "adapters.safetensors")
-            print(f"Promoted iter {best_iter} (val {best_val:.3f}) to adapters.safetensors")
+def run_training(name, data_dir, adapter_dir, model_key="qwen-3b", learning_rate=1e-5,
+                 rank=16, num_layers=None, style_select=True, log=print):
+    data_dir, adapter_dir = Path(data_dir), Path(adapter_dir)
+    repo = MODELS[model_key]["repo"]
 
-    # mlx_lm saves a full-size checkpoint (tens-hundreds of MB, scales with
-    # rank/num_layers) at every eval — clean up everything except the one
-    # already-copied adapters.safetensors, or these pile up per persona and
-    # bloat the download/share zip with checkpoints nobody will ever load.
-    for stray in adapter_dir.glob("*_adapters.safetensors"):
-        stray.unlink()
+    log(f"Sizing examples with the {repo} tokenizer…")
+    data_meta = prepare_data.build_dataset(data_dir, tokenizer_model=repo)
+    log(f"{data_meta['n_train']} train rows ({data_meta['n_train_replies']} replies) · {data_meta['n_val']} validation rows")
+    if data_meta["n_train"] < 4 or data_meta["n_val"] < 2:
+        raise RuntimeError("Not enough examples to train — upload a longer chat export.")
 
-    persona_meta = {
-        "persona": persona,
-        "model": MODELS[model_key][0],
-        "model_key": model_key,
-        "best_val": best_val,
-        "best_iter": best_iter,
-        "hparams": hp,
-        # Carried over so chat_infer.py uses the exact same system prompt at
-        # inference that the adapter was trained against (including any
-        # mined signature-phrase priming) — a mismatch here wastes some of
-        # what LoRA training actually learned.
-        "system_prompt": meta.get("system_prompt"),
+    hp = pick_hparams(data_meta["n_train"], model_key, rank=rank, num_layers=num_layers,
+                      learning_rate=learning_rate)
+    staging = staging_dir_for(adapter_dir)
+    shutil.rmtree(staging, ignore_errors=True)
+    staging.mkdir(parents=True)
+    if data_meta["prompt_style"] == "retrieval":
+        shutil.copy(data_dir / "exemplars.jsonl", staging / "exemplars.jsonl")
+
+    stored_settings = {}
+    if (adapter_dir / "settings.json").exists():
+        stored_settings = json.loads((adapter_dir / "settings.json").read_text())
+    config = {
+        "model": repo,
+        "data_dir": str(data_dir),
+        "adapter_dir": str(staging),
+        "seed": 0,
+        "batch_size": hp["batch_size"],
+        "grad_accumulation_steps": hp["grad_accumulation_steps"],
+        "iters": hp["iters"],
+        "steps_per_eval": hp["steps_per_eval"],
+        "steps_per_report": hp["steps_per_report"],
+        "max_seq_length": data_meta["max_seq_length"],
+        "grad_checkpoint": hp["grad_checkpoint"],
+        "num_layers": hp["num_layers"],
+        "lora_parameters": {"rank": hp["rank"], "scale": 20.0, "dropout": 0.05},
+        "lr_schedule": hp["lr_schedule"],
+        "patience": 3,
+        "candidate_tolerance": 0.02,
+        "max_candidates": 3,
+        "style_select": style_select,
+        "style_samples": 48,
+        "generation": resolve_settings(stored_settings, data_meta["reply_tokens_p95"]),
     }
-    (adapter_dir / "persona_meta.json").write_text(json.dumps(persona_meta, indent=2))
+    config_path = staging / "run_config.json"
+    config_path.write_text(json.dumps(config, indent=2))
+
+    cmd = [sys.executable, str(BACKEND_DIR / "lora_train.py"), "--config", str(config_path)]
+    log("Running: " + " ".join(cmd))
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                            cwd=str(BACKEND_DIR), bufsize=1)
+    tail = []
+    for line in proc.stdout:
+        line = line.rstrip()
+        if line.startswith(EVENT_PREFIX):
+            log(_describe_event(json.loads(line[len(EVENT_PREFIX):])))
+        elif line and not MLX_PROGRESS_RE.match(line):  # already reported via events
+            log(line)
+            tail = (tail + [line])[-15:]
+    if proc.wait() != 0:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise RuntimeError("Training failed:\n" + "\n".join(tail))
+
+    selection = json.loads((staging / "selection.json").read_text())
+    persona_meta = persona_meta_from(
+        data_meta,
+        model=repo,
+        model_key=model_key,
+        trained_on="local",
+        best_val=selection["chosen_val"],
+        best_iter=selection["chosen_steps"],
+        base_val=selection["base_val"],
+        style=selection["style"],
+        warnings=selection["warnings"],
+        hparams=hp,
+    )
+    (staging / "persona_meta.json").write_text(json.dumps(persona_meta, indent=2, ensure_ascii=False))
+    swap_in(staging, adapter_dir)
+    log(f"Done — kept the checkpoint after {selection['chosen_steps']} steps.")
     return persona_meta
+
+
+def _describe_event(evt):
+    kind = evt["event"]
+    if kind == "val":
+        return f"step {evt['steps']}: validation loss {evt['loss']:.3f}"
+    if kind == "train":
+        return f"step {evt['iter']}: train loss {evt['loss']:.3f} · {evt['tokens_per_sec']} tok/s · {evt['peak_mem_gb']} GB"
+    if kind == "early_stop":
+        return f"Stopping early: no improvement for {evt['patience']} evals (best at step {evt['best_steps']})."
+    if kind == "style":
+        return f"Style check, step {evt['steps']}: distance {evt['style_distance']:.3f} (val {evt['val_loss']:.3f})"
+    if kind == "dataset":
+        skipped = evt["skipped_long"] + evt["skipped_template"]
+        return f"Tokenized {evt['train']} train / {evt['val']} val rows" + (f" ({skipped} skipped)" if skipped else "")
+    if kind in ("warning", "error"):
+        return f"{kind.upper()}: {evt['message']}"
+    if kind == "done":
+        return f"Selected step {evt['chosen_steps']} (val {evt['chosen_val']:.3f})"
+    return json.dumps(evt)
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--persona", required=True)
-    ap.add_argument("--data_dir", required=True)
-    ap.add_argument("--adapter_dir", required=True)
-    ap.add_argument("--model", dest="model_key", choices=list(MODELS), default="qwen-7b")
+    ap.add_argument("--name", required=True, help="Persona id (data/processed/<name>)")
+    ap.add_argument("--model", dest="model_key", choices=list(MODELS), default="qwen-3b")
     ap.add_argument("--learning_rate", type=float, default=1e-5)
-    ap.add_argument("--max_seq_length", type=int, default=512)
-    ap.add_argument("--rank", type=int, default=16,
-                     help="LoRA rank — higher absorbs more of the person's voice, "
-                          "at the cost of training time. mlx_lm's own default is 8.")
+    ap.add_argument("--rank", type=int, default=16)
     ap.add_argument("--num_layers", type=int, default=None,
-                     help="Layers to adapt (-1 for all). Defaults to 24 (small models) / 16 (large).")
+                    help="Layers to adapt (-1 for all). Defaults to 24 (small models) / 16 (large).")
+    ap.add_argument("--no_style_select", action="store_true",
+                    help="Pick the checkpoint by validation loss only (skips generating samples).")
     args = ap.parse_args()
 
+    root = BACKEND_DIR.parent
     meta = run_training(
-        args.persona, args.data_dir, args.adapter_dir,
-        model_key=args.model_key, learning_rate=args.learning_rate,
-        max_seq_length=args.max_seq_length,
-        rank=args.rank, num_layers=args.num_layers,
+        args.name, root / "data" / "processed" / args.name, root / "models" / "adapters" / args.name,
+        model_key=args.model_key, learning_rate=args.learning_rate, rank=args.rank,
+        num_layers=args.num_layers, style_select=not args.no_style_select,
     )
-    print(json.dumps(meta, indent=2))
+    print(json.dumps(meta, indent=2, ensure_ascii=False))
 
 
 if __name__ == "__main__":

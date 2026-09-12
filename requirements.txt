@@ -1,9 +1,6 @@
-mlx
-mlx-lm
-tokenizers
+mlx-lm==0.31.3  # lora_train.py builds on mlx_lm's trainer internals; bump deliberately
 transformers
 numpy
-pyyaml
 fastapi
 uvicorn
 python-multipart

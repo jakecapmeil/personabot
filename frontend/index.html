@@ -20,7 +20,14 @@
       <h2>Upload a chat export</h2>
       <form id="upload-form">
         <label>Persona name (id)<input id="persona-name" placeholder="e.g. hudson" required /></label>
-        <label>Their label in the file (if not "Me")<input id="me-label" value="Me" /></label>
+        <label>Their name (optional — used instead of a phone number or email)<input id="display-name" placeholder="e.g. Hudson" /></label>
+        <label>Your own label in the file<input id="me-label" value="Me" /></label>
+        <label>Style hints in the prompt
+          <select id="prompt-style">
+            <option value="minimal" selected>None — the voice comes from training</option>
+            <option value="retrieval">Their real replies to similar messages</option>
+          </select>
+        </label>
 
         <label class="file-row">
           Chat export (.txt)
@@ -33,7 +40,8 @@
 
         <button type="submit" class="pill-button primary">Prepare data</button>
       </form>
-      <p id="upload-status" class="status"></p>
+      <p id="upload-status" class="status" role="status"></p>
+      <div id="sender-choice" class="sender-choice hidden"></div>
     </section>
 
     <section id="personas-section" class="panel">
@@ -118,6 +126,8 @@
             own thread with the same person. Look for more than one
             exported file matching them and merge before uploading:
             <pre>cat person-number.txt person-email.txt > combined.txt</pre>
+            After uploading, tick both handles when personabot asks which
+            senders are this person.
           </li>
         </ol>
       </div>
@@ -144,13 +154,15 @@
           <li>Run the cells in order. The upload cell asks for two files —
             select <b>both</b> <code>train.jsonl</code> and
             <code>valid.jsonl</code> together from your Downloads folder.</li>
-          <li>When it finishes, the last cell downloads
-            <code>merged_model.zip</code> back to this Mac.</li>
-          <li>Back here, use <b>Import trained model (.zip)</b> on this
+          <li>When it finishes, the export cell downloads
+            <code>persona_adapter.zip</code> (a few hundred MB at most) back
+            to this Mac.</li>
+          <li>Back here, use <b>Import Colab adapter (.zip)</b> on this
             persona's card (or run <code>import_colab.py</code> — see
             README) with that file.</li>
         </ol>
-        <p class="help-note">The notebook is plain code — no chat data in
+        <p class="help-note">The notebook trains the model picked in this
+          persona's settings. It's plain code — no chat data in
           it. Only <code>train.jsonl</code>/<code>valid.jsonl</code> carry
           this person's texts.</p>
       </div>

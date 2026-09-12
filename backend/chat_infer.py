@@ -1,122 +1,164 @@
 """
-Loads a persona's base model + LoRA adapter once and serves generations.
-Keeps a small in-process cache so switching between personas already chatted
-with in this session doesn't reload the (multi-GB) base model each time —
-but only one persona's weights are resident at a time to stay within 16GB.
+Serves chat replies for one persona at a time (16 GB budget).
+
+- The prompt is rebuilt exactly as in training: same system prompt (with
+  retrieved exemplars for the "retrieval" style) and a history window of the
+  length the adapter was trained on.
+- The KV cache from the previous turn is reused for the shared prompt prefix,
+  so each turn only prefills the new messages.
+- A lock serializes loading and generation: concurrent share-link chats can't
+  swap weights mid-reply or load two models at once.
 """
 import json
+import threading
 from pathlib import Path
 
-import mlx.core as mx
-from mlx_lm import load, generate
-from mlx_lm.sample_utils import make_sampler
-
-# Fallback only — real adapters carry their own trained system_prompt
-# (persona_meta.json, written by train_local.py from prepare_data.py's
-# mined signature-phrase priming). Used only if that's ever missing.
-FALLBACK_SYSTEM_TEMPLATE = (
-    "You are {persona}, texting a close friend. Reply exactly the way "
-    "{persona} actually texts: their real tone, slang, punctuation, "
-    "capitalization, and typical message length (short replies are fine — "
-    "don't pad them out). Never mention being an AI or a model."
+import prepare_data
+from generation import (
+    SETTINGS_VERSION, add_end_of_turn_eos, clean_reply, generate_reply, resolve_settings, sticky_window,
 )
+from retrieval import ExemplarIndex
 
-DEFAULT_SETTINGS = {
-    "temperature": 0.7,
-    "top_p": 0.9,
-    "max_tokens": 48,
-    "repetition_penalty": 1.15,
-    "repetition_context": 24,
-}
+LEGACY_CONTEXT_TURNS = 4
 
-_cache = {"persona": None, "model": None, "tokenizer": None, "meta": None}
+_lock = threading.RLock()
+_state = {"key": None, "meta": None, "model": None, "tokenizer": None, "index": None,
+          "prompt_cache": None, "cache_tokens": []}
 
 
-def _load_persona(adapter_dir):
-    meta = json.loads((Path(adapter_dir) / "persona_meta.json").read_text())
+def load_persona(adapter_dir):
+    from mlx_lm import load
+
+    adapter_dir = Path(adapter_dir)
+    meta = json.loads((adapter_dir / "persona_meta.json").read_text())
     if meta.get("merged"):
-        # Colab-trained + locally merged/converted (import_colab.py) — a
-        # plain fine-tuned MLX model, no separate adapter to attach.
-        model, tokenizer = load(meta["model"])
+        model, tokenizer = load(meta["model"])  # legacy merged Colab import
     else:
         model, tokenizer = load(meta["model"], adapter_path=str(adapter_dir))
+    add_end_of_turn_eos(tokenizer)
     return meta, model, tokenizer
 
 
+def read_settings_file(adapter_dir):
+    path = Path(adapter_dir) / "settings.json"
+    return json.loads(path.read_text()) if path.exists() else {}
+
+
+def _persona_meta(adapter_dir):
+    path = Path(adapter_dir) / "persona_meta.json"
+    return json.loads(path.read_text()) if path.exists() else {}
+
+
 def load_settings(adapter_dir):
+    return resolve_settings(read_settings_file(adapter_dir), _persona_meta(adapter_dir).get("reply_tokens_p95"))
+
+
+def save_settings(adapter_dir, updates):
+    """Stores only values the user actually set, so default changes reach
+    personas nobody has customized."""
     path = Path(adapter_dir) / "settings.json"
-    settings = dict(DEFAULT_SETTINGS)
-    if path.exists():
-        settings.update(json.loads(path.read_text()))
-    return settings
+    stored = read_settings_file(adapter_dir)
+    if stored.get("version") != SETTINGS_VERSION:
+        stored = {}
+    stored.update({k: v for k, v in updates.items() if v is not None})
+    stored["version"] = SETTINGS_VERSION
+    path.write_text(json.dumps(stored, indent=2))
+    return load_settings(adapter_dir)
 
 
-def save_settings(adapter_dir, settings):
-    path = Path(adapter_dir) / "settings.json"
-    merged = load_settings(adapter_dir)
-    merged.update(settings)
-    path.write_text(json.dumps(merged, indent=2))
-    return merged
+def unload():
+    with _lock:
+        _state.update(key=None, meta=None, model=None, tokenizer=None, index=None,
+                      prompt_cache=None, cache_tokens=[])
+        try:
+            import gc
+
+            import mlx.core as mx
+            gc.collect()
+            mx.clear_cache()
+        except ImportError:
+            pass
 
 
-def _repetition_penalty_processor(penalty, context_size):
-    """A simple recency-window repetition penalty (GPT-style): divide the
-    logits of recently-used tokens so the model is discouraged from reusing
-    them. Without this, a lightly-trained adapter tends to collapse onto a
-    handful of stock replies — the same failure mode the from-scratch model
-    in hudson-bot/ hit, addressed there the same way."""
-    if not penalty or penalty <= 1.0:
-        return None
-
-    def processor(tokens, logits):
-        if tokens.size == 0:
-            return logits
-        recent = tokens[-context_size:]
-        idx = mx.array(sorted(set(recent.tolist())))
-        vals = logits[..., idx]
-        vals = mx.where(vals > 0, vals / penalty, vals * penalty)
-        logits[..., idx] = vals
-        return logits
-
-    return processor
+def loaded_adapter():
+    return _state["key"]
 
 
-def reply(adapter_dir, persona, history, **overrides):
-    """
-    history: list of {"role": "user"|"assistant", "content": str}, ending
-    with the newest user message. Returns the persona's reply text.
+def _ensure_loaded(adapter_dir):
+    key = str(Path(adapter_dir).resolve())
+    if _state["key"] == key:
+        return
+    unload()
+    meta, model, tokenizer = load_persona(adapter_dir)
+    index = None
+    exemplars = Path(adapter_dir) / "exemplars.jsonl"
+    if meta.get("prompt_style") == "retrieval" and exemplars.exists():
+        index = ExemplarIndex.load(exemplars)
+    _state.update(key=key, meta=meta, model=model, tokenizer=tokenizer, index=index)
 
-    Generation settings (temperature/top_p/max_tokens/repetition_penalty) are
-    read from settings.json in adapter_dir when present, overridden by any
-    keyword passed in here, falling back to DEFAULT_SETTINGS otherwise —
-    letting the settings UI change behavior without every caller needing to
-    know every knob.
-    """
-    adapter_dir = str(adapter_dir)
-    if _cache["persona"] != adapter_dir:
-        meta, model, tokenizer = _load_persona(adapter_dir)
-        _cache.update(persona=adapter_dir, model=model, tokenizer=tokenizer, meta=meta)
 
-    meta = _cache["meta"]
-    tokenizer = _cache["tokenizer"]
-    settings = load_settings(adapter_dir)
-    settings.update({k: v for k, v in overrides.items() if v is not None})
+def build_messages(meta, history, index=None):
+    """System prompt + trained-length history window, matching training."""
+    keep = meta.get("context_turns") or LEGACY_CONTEXT_TURNS
+    window = sticky_window(history, keep)
+    display_name = meta.get("display_name") or meta.get("persona") or "them"
+    if meta.get("format_version", 1) < 2:
+        system = meta.get("system_prompt") or prepare_data.base_system_prompt(display_name)
+    else:
+        exemplars = []
+        if index is not None:
+            query = next((m["content"] for m in reversed(window) if m["role"] == "user"), "")
+            exemplars = index.search(query, k=prepare_data.EXEMPLARS_PER_PROMPT) if query else []
+        system = prepare_data.render_system_prompt(display_name, exemplars)
+    return [{"role": "system", "content": system}] + window
 
-    system_content = meta.get("system_prompt") or FALLBACK_SYSTEM_TEMPLATE.format(persona=persona)
-    messages = [{"role": "system", "content": system_content}] + history
-    prompt = tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
 
-    sampler = make_sampler(temp=settings["temperature"], top_p=settings["top_p"])
-    logits_processors = None
-    penalty_fn = _repetition_penalty_processor(
-        settings.get("repetition_penalty"), settings.get("repetition_context", 24)
-    )
-    if penalty_fn is not None:
-        logits_processors = [penalty_fn]
+def _common_prefix(a, b):
+    n = min(len(a), len(b))
+    i = 0
+    while i < n and a[i] == b[i]:
+        i += 1
+    return i
 
-    text = generate(
-        _cache["model"], tokenizer, prompt=prompt,
-        max_tokens=settings["max_tokens"], sampler=sampler,
-        logits_processors=logits_processors, verbose=False,
-    )
-    return text.strip()
+
+def _reusable_prefix(prompt_tokens):
+    from mlx_lm.models.cache import can_trim_prompt_cache, trim_prompt_cache
+
+    cache, cached = _state["prompt_cache"], _state["cache_tokens"]
+    if cache is None or not can_trim_prompt_cache(cache):
+        return 0
+    if getattr(cache[0], "offset", None) != len(cached):
+        return 0
+    keep = min(_common_prefix(cached, prompt_tokens), len(prompt_tokens) - 1)
+    drop = len(cached) - keep
+    if drop and trim_prompt_cache(cache, drop) != drop:
+        return 0
+    return keep
+
+
+def reply(adapter_dir, history, **overrides):
+    """history: [{"role": "user"|"assistant", "content": str}, ...] ending
+    with the newest user message. Returns the reply; separate bubbles are
+    separated by "\n"."""
+    from mlx_lm.models.cache import make_prompt_cache
+
+    with _lock:
+        _ensure_loaded(adapter_dir)
+        meta, model, tokenizer = _state["meta"], _state["model"], _state["tokenizer"]
+        settings = resolve_settings(read_settings_file(adapter_dir), meta.get("reply_tokens_p95"), overrides)
+        messages = build_messages(meta, history, _state["index"])
+        prompt_tokens = list(tokenizer.apply_chat_template(messages, add_generation_prompt=True))
+
+        prefix = _reusable_prefix(prompt_tokens)
+        if prefix == 0:
+            _state["prompt_cache"] = make_prompt_cache(model)
+        cache = _state["prompt_cache"]
+        _state["cache_tokens"] = []  # invalid until generation finishes cleanly
+        text, finish, generated = generate_reply(model, tokenizer, prompt_tokens, settings,
+                                                 prompt_cache=cache, cached_prefix=prefix)
+        offset = getattr(cache[0], "offset", None)
+        all_tokens = prompt_tokens + generated
+        _state["cache_tokens"] = all_tokens[:offset] if offset is not None and offset <= len(all_tokens) else []
+        if not _state["cache_tokens"]:
+            _state["prompt_cache"] = None
+        return clean_reply(text, finish)

@@ -1,211 +1,216 @@
 """
-Generates a self-contained Colab notebook that fine-tunes Qwen2.5-7B-Instruct
-with Unsloth on a persona's prepared data — the "cloud" backend. Faster than
-local in principle (a dedicated T4 has real tensor cores and more memory
-bandwidth than the M-series' unified-memory GPU, and Unsloth's fused kernels
-are built for exactly this), at the cost of running outside your machine —
-though I have no GPU/Colab access to verify actual wall-clock speed myself,
-unlike the local MLX path, which I've run and measured directly.
+Generates the Colab notebook for cloud training (Unsloth on a free T4).
 
-Earlier version embedded train.jsonl/valid.jsonl directly in the notebook
-(base64, one code cell) to cut the upload/download count from three to two.
-Reverted: for a corpus of any real size the resulting .ipynb (tens of MB)
-was too heavy for Colab's own notebook loader to open reliably. Back to
-three separate files — plain code, no chat data baked in — with
-`app.py`'s /colab_bundle endpoint packaging all three as one zip so it's
-still a single click on the personabot side.
+It trains the same objective as local training: the loss covers exactly the
+replies listed in each row's "train_turns" (so persona messages that appear
+as context are never trained twice), for one epoch with early stopping, on
+the model selected in personabot's settings.
 
-I have not been able to execute this notebook myself (no GPU/Colab access
-from here) — unlike the local MLX path, which I ran end-to-end. The Unsloth
-API surface below is correct as of my training data, but if a cell errors
-on a version mismatch, Unsloth's own docs/GitHub are the fastest fix.
+It downloads only the LoRA adapter (`persona_adapter.zip`, ~100-300 MB),
+which import_colab.py converts to mlx-lm format — no multi-GB merged model
+and no lossy re-quantization.
+
+The notebook contains no chat data; train.jsonl / valid.jsonl are uploaded
+into it separately.
+
+This has not been run end-to-end on Colab from here. If Unsloth changes its
+API, its docs are the fastest fix; the training loop itself is plain
+transformers.Trainer.
 
 Usage:
-    python colab_export.py --persona Hudson --out hudson_colab.ipynb
+    python colab_export.py --name hudson --model qwen-3b --out hudson_colab.ipynb
 """
 import argparse
 import json
+from pathlib import Path
 
-MODEL_NAME = "unsloth/Qwen2.5-7B-Instruct-bnb-4bit"
+import train_local
+
+INTRO = """# {display_name} — cloud fine-tune (Unsloth + Colab)
+
+**Runtime → Change runtime type → T4 GPU** before running.
+
+Trains a LoRA adapter on `{model_repo}` from `train.jsonl` / `valid.jsonl`
+(downloaded alongside this notebook). The last cell downloads
+`persona_adapter.zip`; import it on the persona's card in personabot."""
+
+INSTALL = """!pip install -q unsloth"""
+
+UPLOAD = """from google.colab import files
+print('Select train.jsonl and valid.jsonl together:')
+uploaded = files.upload()
+assert 'train.jsonl' in uploaded and 'valid.jsonl' in uploaded, \\
+    'Upload both train.jsonl and valid.jsonl — they were downloaded alongside this notebook.'"""
+
+LOAD_MODEL = """from unsloth import FastLanguageModel
+
+MODEL_KEY = {model_key!r}
+MAX_SEQ_LENGTH = {max_seq_length}
+RANK = {rank}
+ALPHA = {rank}
+TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+
+model, tokenizer = FastLanguageModel.from_pretrained(
+    model_name={unsloth_repo!r},
+    max_seq_length=MAX_SEQ_LENGTH,
+    load_in_4bit=True,
+)
+model = FastLanguageModel.get_peft_model(
+    model,
+    r=RANK,
+    lora_alpha=ALPHA,
+    lora_dropout=0,
+    target_modules=TARGET_MODULES,
+    use_gradient_checkpointing="unsloth",
+    random_state=0,
+)"""
+
+DATA = """import json
+from datasets import Dataset
+
+def load_jsonl(path):
+    with open(path) as f:
+        return [json.loads(line) for line in f if line.strip()]
+
+def ids(messages, add_generation_prompt):
+    return tokenizer.apply_chat_template(
+        messages, tokenize=True, add_generation_prompt=add_generation_prompt, return_dict=False)
+
+def encode(row):
+    messages = row["messages"]
+    input_ids = ids(messages, False)
+    labels = [-100] * len(input_ids)
+    for i in row["train_turns"]:
+        start = len(ids(messages[:i], True))
+        end = len(ids(messages[:i + 1], False))
+        labels[start:end] = input_ids[start:end]
+    return {"input_ids": input_ids, "attention_mask": [1] * len(input_ids), "labels": labels}
+
+def build(path):
+    rows = [encode(r) for r in load_jsonl(path)]
+    rows = [r for r in rows if len(r["input_ids"]) <= MAX_SEQ_LENGTH and any(l != -100 for l in r["labels"])]
+    return Dataset.from_list(rows)
+
+train_ds, valid_ds = build("train.jsonl"), build("valid.jsonl")
+print(len(train_ds), "train rows ·", len(valid_ds), "validation rows")"""
+
+TRAIN = """import math
+from transformers import DataCollatorForSeq2Seq, EarlyStoppingCallback, Trainer, TrainingArguments
+from unsloth import is_bfloat16_supported
+
+BATCH, ACCUM = 4, 2
+steps_per_epoch = max(1, math.ceil(len(train_ds) / (BATCH * ACCUM)))
+eval_every = max(5, steps_per_epoch // 10)
+
+trainer = Trainer(
+    model=model,
+    train_dataset=train_ds,
+    eval_dataset=valid_ds,
+    data_collator=DataCollatorForSeq2Seq(tokenizer, padding=True, label_pad_token_id=-100),
+    args=TrainingArguments(
+        output_dir="outputs",
+        per_device_train_batch_size=BATCH,
+        per_device_eval_batch_size=BATCH,
+        gradient_accumulation_steps=ACCUM,
+        num_train_epochs=1,
+        learning_rate=2e-4,
+        warmup_ratio=0.05,
+        lr_scheduler_type="cosine",
+        logging_steps=max(1, eval_every // 2),
+        eval_strategy="steps",
+        eval_steps=eval_every,
+        save_strategy="steps",
+        save_steps=eval_every,
+        save_total_limit=2,
+        load_best_model_at_end=True,
+        metric_for_best_model="eval_loss",
+        greater_is_better=False,
+        fp16=not is_bfloat16_supported(),
+        bf16=is_bfloat16_supported(),
+        report_to="none",
+        seed=0,
+    ),
+    callbacks=[EarlyStoppingCallback(early_stopping_patience=3)],
+)
+trainer.train()"""
+
+EXPORT = """import os, shutil
+from peft import get_peft_model_state_dict
+from safetensors.torch import save_file
+
+os.makedirs("persona_adapter", exist_ok=True)
+state = {k: v.detach().float().cpu().contiguous() for k, v in get_peft_model_state_dict(model).items()}
+save_file(state, "persona_adapter/adapter_model.safetensors")
+with open("persona_adapter/personabot_adapter.json", "w") as f:
+    json.dump({"format": "peft-lora", "model_key": MODEL_KEY, "rank": RANK, "alpha": ALPHA,
+               "target_modules": TARGET_MODULES}, f, indent=2)
+shutil.make_archive("persona_adapter", "zip", "persona_adapter")
+files.download("persona_adapter.zip")"""
+
+CHAT = """FastLanguageModel.for_inference(model)
+SYSTEM = {system_prompt!r}
+
+history = [{{"role": "system", "content": SYSTEM}}]
+while True:
+    msg = input("Me: ")
+    if not msg:
+        break
+    history.append({{"role": "user", "content": msg}})
+    inputs = tokenizer.apply_chat_template(
+        history, add_generation_prompt=True, return_tensors="pt", return_dict=False).to("cuda")
+    out = model.generate(input_ids=inputs, max_new_tokens=96, temperature=0.8, min_p=0.05, do_sample=True)
+    reply = tokenizer.decode(out[0][inputs.shape[1]:], skip_special_tokens=True).strip()
+    print({display_name!r} + ":", reply)
+    history.append({{"role": "assistant", "content": reply}})"""
 
 
-def cell(cell_type, lines):
-    return {
+def _cell(cell_type, source):
+    lines = source.split("\n")
+    cell = {
         "cell_type": cell_type,
         "metadata": {},
-        "source": [l + "\n" for l in lines[:-1]] + ([lines[-1]] if lines else []),
-        **({"outputs": [], "execution_count": None} if cell_type == "code" else {}),
+        "source": [line + "\n" for line in lines[:-1]] + [lines[-1]],
     }
+    if cell_type == "code":
+        cell.update(outputs=[], execution_count=None)
+    return cell
 
 
-def build_notebook(persona):
+def build_notebook(data_meta, model_key, rank=16):
+    model = train_local.MODELS[model_key]
+    fmt = {
+        "display_name": data_meta["display_name"],
+        "model_key": model_key,
+        "model_repo": model["unsloth"],
+        "unsloth_repo": model["unsloth"],
+        "rank": int(rank),
+        "max_seq_length": data_meta.get("max_seq_length", 1024),
+        "system_prompt": data_meta["system_prompt"],
+    }
     cells = [
-        cell("markdown", [
-            f"# {persona} chatbot — cloud fine-tune (Unsloth + Colab)",
-            "",
-            "Runtime: **Runtime > Change runtime type > T4 GPU** (or better) before running.",
-            "",
-            f"This notebook trains a LoRA adapter on `{persona}`'s texting style. "
-            "You should have downloaded this notebook together with `train.jsonl` "
-            "and `valid.jsonl` — upload those two when prompted below. Nothing else "
-            "about the conversation leaves your machine except what you upload in "
-            "that cell.",
-        ]),
-        cell("code", [
-            "!pip install -q unsloth trl==0.9.6",
-        ]),
-        cell("markdown", ["## 1. Upload the prepared data (train.jsonl, valid.jsonl)"]),
-        cell("code", [
-            "from google.colab import files",
-            "print('Select train.jsonl and valid.jsonl from your computer:')",
-            "uploaded = files.upload()",
-            "assert 'train.jsonl' in uploaded and 'valid.jsonl' in uploaded, \\",
-            "    'Upload both train.jsonl and valid.jsonl — they were downloaded ' \\",
-            "    'alongside this notebook.'",
-        ]),
-        cell("markdown", ["## 2. Load the base model (4-bit) + attach LoRA"]),
-        cell("code", [
-            "from unsloth import FastLanguageModel",
-            "",
-            f"model, tokenizer = FastLanguageModel.from_pretrained(",
-            f'    model_name="{MODEL_NAME}",',
-            "    max_seq_length=1024,",
-            "    load_in_4bit=True,",
-            ")",
-            "",
-            "model = FastLanguageModel.get_peft_model(",
-            "    model,",
-            "    r=32,",
-            "    lora_alpha=32,",
-            "    lora_dropout=0.05,",
-            "    target_modules=[\"q_proj\", \"k_proj\", \"v_proj\", \"o_proj\",",
-            "                    \"gate_proj\", \"up_proj\", \"down_proj\"],",
-            "    use_gradient_checkpointing=\"unsloth\",",
-            ")",
-        ]),
-        cell("markdown", [
-            "## 3. Load the data and format with the model's chat template",
-        ]),
-        cell("code", [
-            "import json",
-            "from datasets import Dataset",
-            "",
-            "def load_jsonl(path):",
-            "    return [json.loads(l) for l in open(path)]",
-            "",
-            "train_rows = load_jsonl('train.jsonl')",
-            "valid_rows = load_jsonl('valid.jsonl')",
-            "",
-            "def to_text(example):",
-            "    return {\"text\": tokenizer.apply_chat_template(",
-            "        example[\"messages\"], tokenize=False, add_generation_prompt=False)}",
-            "",
-            "train_ds = Dataset.from_list(train_rows).map(to_text)",
-            "valid_ds = Dataset.from_list(valid_rows).map(to_text)",
-            "print(train_ds[0][\"text\"][:400])",
-        ]),
-        cell("markdown", [
-            "## 4. Train (loss masked to the persona's reply tokens only)",
-        ]),
-        cell("code", [
-            "from trl import SFTTrainer, SFTConfig",
-            "from unsloth.chat_templates import train_on_responses_only",
-            "",
-            "trainer = SFTTrainer(",
-            "    model=model,",
-            "    tokenizer=tokenizer,",
-            "    train_dataset=train_ds,",
-            "    eval_dataset=valid_ds,",
-            "    dataset_text_field=\"text\",",
-            "    max_seq_length=1024,",
-            "    args=SFTConfig(",
-            "        per_device_train_batch_size=4,",
-            "        gradient_accumulation_steps=4,",
-            "        num_train_epochs=3,",
-            "        learning_rate=2e-4,",
-            "        warmup_ratio=0.05,",
-            "        lr_scheduler_type=\"cosine\",",
-            "        logging_steps=10,",
-            "        eval_strategy=\"steps\",",
-            "        eval_steps=50,",
-            "        save_strategy=\"steps\",",
-            "        save_steps=50,",
-            "        load_best_model_at_end=True,",
-            "        metric_for_best_model=\"eval_loss\",",
-            "        output_dir=\"outputs\",",
-            "        report_to=\"none\",",
-            "    ),",
-            ")",
-            "",
-            "# Only train on the assistant's final reply, not the prompt/history —",
-            "# same reasoning as --mask-prompt in the local MLX path.",
-            "trainer = train_on_responses_only(",
-            "    trainer,",
-            "    instruction_part=\"<|im_start|>user\\n\",",
-            "    response_part=\"<|im_start|>assistant\\n\",",
-            ")",
-            "",
-            "trainer.train()",
-        ]),
-        cell("markdown", [
-            "## 5. Merge the adapter into the base model, then download",
-            "",
-            "The LoRA adapter alone is HF/PEFT format and **not** loadable by "
-            "personabot's local MLX chat server. Merging it into the base weights "
-            "produces a plain fine-tuned model with no adapter-format mismatch — "
-            "download the zip below, then back on your Mac run:",
-            "",
-            "```bash",
-            "cd personabot/backend",
-            "python3 import_colab.py --name <persona-name> --zip ~/Downloads/merged_model.zip",
-            "```",
-            "",
-            "That converts it to MLX format (`mlx_lm.convert`, quantized to match the "
-            "local models) and registers it as a ready-to-chat persona in the app.",
-        ]),
-        cell("code", [
-            "merged_dir = \"merged_model\"",
-            "model.save_pretrained_merged(merged_dir, tokenizer, save_method=\"merged_16bit\")",
-            "",
-            "import shutil",
-            "shutil.make_archive(\"merged_model\", \"zip\", merged_dir)",
-            "files.download(\"merged_model.zip\")",
-        ]),
-        cell("markdown", [
-            "## 6. Chat with it right here (optional)",
-            "",
-            "Skippable if you're importing into personabot instead — see step 5.",
-        ]),
-        cell("code", [
-            "FastLanguageModel.for_inference(model)",
-            "",
-            f'SYSTEM = ("You are {persona}, texting a close friend. Reply exactly the way "',
-            f'          "{persona} actually texts: their real tone, slang, punctuation, "',
-            '          "capitalization, and typical message length. Never mention being an AI.")',
-            "",
-            "history = [{\"role\": \"system\", \"content\": SYSTEM}]",
-            "while True:",
-            "    msg = input(\"Me: \")",
-            "    if not msg:",
-            "        break",
-            "    history.append({\"role\": \"user\", \"content\": msg})",
-            "    prompt = tokenizer.apply_chat_template(",
-            "        history, tokenize=False, add_generation_prompt=True)",
-            "    inputs = tokenizer(prompt, return_tensors=\"pt\").to(\"cuda\")",
-            "    out = model.generate(**inputs, max_new_tokens=120, temperature=0.8,",
-            "                          top_p=0.9, do_sample=True)",
-            "    reply = tokenizer.decode(",
-            "        out[0][inputs[\"input_ids\"].shape[1]:], skip_special_tokens=True)",
-            f'    print(f"{persona}: {{reply}}")',
-            "    history.append({\"role\": \"assistant\", \"content\": reply})",
-        ]),
+        _cell("markdown", INTRO.format(**fmt)),
+        _cell("code", INSTALL),
+        _cell("markdown", "## 1. Upload the prepared data"),
+        _cell("code", UPLOAD),
+        _cell("markdown", "## 2. Load the base model (4-bit) and attach LoRA"),
+        _cell("code", LOAD_MODEL.format(**fmt)),
+        _cell("markdown", "## 3. Tokenize, masking the loss to the persona's replies"),
+        _cell("code", DATA),
+        _cell("markdown", "## 4. Train (one epoch, best checkpoint by validation loss, early stopping)"),
+        _cell("code", TRAIN),
+        _cell("markdown", "## 5. Download the adapter\n\nImport `persona_adapter.zip` on the persona's card "
+                          "in personabot, or run `python3 backend/import_colab.py --name <persona> --zip "
+                          "~/Downloads/persona_adapter.zip`."),
+        _cell("code", EXPORT),
+        _cell("markdown", "## 6. Chat with it here (optional)\n\nUses the base identity prompt; personas "
+                          "with retrieved examples get those in personabot."),
+        _cell("code", CHAT.format(**fmt)),
     ]
-
     return {
         "cells": cells,
         "metadata": {
             "accelerator": "GPU",
-            "colab": {"name": f"{persona}_finetune.ipynb", "provenance": []},
+            "colab": {"name": f"{data_meta['display_name']}_finetune.ipynb", "provenance": []},
             "kernelspec": {"name": "python3", "display_name": "Python 3"},
         },
         "nbformat": 4,
@@ -215,13 +220,19 @@ def build_notebook(persona):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--persona", required=True, help="Display name, e.g. Hudson")
+    ap.add_argument("--name", required=True, help="Persona id (data/processed/<name>)")
+    ap.add_argument("--model", dest="model_key", choices=list(train_local.MODELS), default="qwen-3b")
+    ap.add_argument("--rank", type=int, default=16)
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
-    nb = build_notebook(args.persona)
-    with open(args.out, "w") as f:
-        json.dump(nb, f, indent=1)
-    print(f"Wrote {args.out} — upload it to https://colab.research.google.com")
+
+    import prepare_data
+
+    data_dir = Path(__file__).resolve().parent.parent / "data" / "processed" / args.name
+    meta = prepare_data.build_dataset(data_dir, tokenizer_model=train_local.MODELS[args.model_key]["repo"])
+    Path(args.out).write_text(json.dumps(build_notebook(meta, args.model_key, args.rank), indent=1))
+    print(f"Wrote {args.out} — upload it to https://colab.research.google.com with "
+          f"{data_dir / 'train.jsonl'} and {data_dir / 'valid.jsonl'}")
 
 
 if __name__ == "__main__":
