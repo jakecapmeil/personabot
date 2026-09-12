@@ -21,6 +21,18 @@ uvicorn app:app --port 8000
 
 Open http://localhost:8000
 
+### Optional: a double-clickable Mac app
+
+```bash
+bash macapp/build.sh
+```
+
+Installs `PersonaBot.app` to `~/Applications` — double-click (or Spotlight)
+starts the server if it isn't running and opens it in your browser. Still a
+browser tab under the hood (a real native window is a bigger project), but
+a real Dock/Finder icon instead of a terminal command. Re-run the script any
+time after moving the repo, since it bakes in an absolute path to it.
+
 ## Getting a `.txt` export
 
 Also available in-app behind the **?** button.

@@ -8,3 +8,4 @@ fastapi
 uvicorn
 python-multipart
 huggingface_hub
+pillow  # macapp/make_icon.py only
