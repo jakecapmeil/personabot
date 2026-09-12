@@ -1,0 +1,10 @@
+mlx
+mlx-lm
+tokenizers
+transformers
+numpy
+pyyaml
+fastapi
+uvicorn
+python-multipart
+huggingface_hub

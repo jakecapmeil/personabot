@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.venv/
+data/uploads/
+data/processed/
+models/adapters/
+models/fused/
+*.log
+*.zip
+.env
+.DS_Store

@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>personabot</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <header>
+    <div class="header-row">
+      <div class="header-spacer"></div>
+      <h1>personabot</h1>
+      <button id="help-btn" class="icon-button" title="How do I get a .txt file?" aria-label="Help">?</button>
+    </div>
+    <p class="tagline">Upload someone's texts. Talk to them.</p>
+  </header>
+
+  <main>
+    <section id="upload-section" class="panel">
+      <h2>Upload a chat export</h2>
+      <form id="upload-form">
+        <label>Persona name (id)<input id="persona-name" placeholder="e.g. hudson" required /></label>
+        <label>Their label in the file (if not "Me")<input id="me-label" value="Me" /></label>
+
+        <label class="file-row">
+          Chat export (.txt)
+          <div class="file-picker">
+            <label class="pill-button file-button" for="persona-file">Choose File</label>
+            <input id="persona-file" type="file" accept=".txt" required hidden />
+            <span id="file-name" class="file-name">No file chosen</span>
+          </div>
+        </label>
+
+        <button type="submit" class="pill-button primary">Prepare data</button>
+      </form>
+      <p id="upload-status" class="status"></p>
+    </section>
+
+    <section id="personas-section" class="panel">
+      <h2>Personas</h2>
+      <div id="persona-list"></div>
+    </section>
+
+    <section id="chat-section" class="panel hidden">
+      <div id="persona-row" class="persona-row"></div>
+
+      <div class="chat-header-row">
+        <h2 id="chat-title">Chat</h2>
+        <button id="clear-chat-btn" class="icon-button" title="Clear chat">
+          <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/></svg>
+        </button>
+      </div>
+      <div id="chat-window"></div>
+      <form id="chat-form">
+        <input id="chat-input" placeholder="Message" autocomplete="off" />
+        <button type="submit" class="send-button" aria-label="Send">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5"/><path d="M6 11l6-6 6 6"/></svg>
+        </button>
+      </form>
+    </section>
+  </main>
+
+  <!-- Settings sheet -->
+  <div id="settings-overlay" class="overlay hidden">
+    <div class="sheet">
+      <div class="sheet-header">
+        <span class="sheet-title" id="settings-title">Settings</span>
+        <button class="icon-button" data-action="close-settings">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M18 6 6 18"/><path d="M6 6l12 12"/></svg>
+        </button>
+      </div>
+      <div class="sheet-body" id="settings-body"></div>
+    </div>
+  </div>
+
+  <!-- Help sheet -->
+  <div id="help-overlay" class="overlay hidden">
+    <div class="sheet">
+      <div class="sheet-header">
+        <span class="sheet-title">Getting a .txt file</span>
+        <button class="icon-button" data-action="close-help">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M18 6 6 18"/><path d="M6 6l12 12"/></svg>
+        </button>
+      </div>
+      <div class="sheet-body help-body">
+        <p>For an iMessage conversation on a Mac:</p>
+        <ol>
+          <li>Install <b>Homebrew</b> if you don't have it, then run:
+            <pre>brew install imessage-exporter</pre>
+          </li>
+          <li>Grant access — the Messages database is protected:
+            <b>System Settings → Privacy &amp; Security → Full Disk Access → add Terminal</b>,
+            then restart Terminal.
+          </li>
+          <li>Export every conversation as text:
+            <pre>imessage-exporter -f txt -o ~/Desktop/exported-messages</pre>
+          </li>
+          <li>Open that folder — one <code>.txt</code> per conversation, named
+            by phone number/email/contact. Find the one for this person.</li>
+          <li>Upload <i>that</i> file above.</li>
+        </ol>
+        <p class="help-note">Already-formatted transcripts work too — any
+          <code>Me: …</code> / <code>Name: …</code> per-line text file.</p>
+      </div>
+    </div>
+  </div>
+
+  <template id="icon-gear">
+    <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+  </template>
+  <template id="icon-trash">
+    <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/></svg>
+  </template>
+  <template id="icon-share">
+    <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12v7a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-7"/><path d="M16 6l-4-4-4 4"/><path d="M12 2v14"/></svg>
+  </template>
+  <template id="icon-download">
+    <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M7 10l5 5 5-5"/><path d="M12 15V3"/></svg>
+  </template>
+  <template id="icon-copy">
+    <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+  </template>
+  <template id="icon-refresh">
+    <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 4v6h-6"/><path d="M1 20v-6h6"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+  </template>
+
+  <script src="/app.js"></script>
+</body>
+</html>
