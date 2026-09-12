@@ -196,8 +196,11 @@ def train_persona(name: str, req: TrainRequest):
         raise HTTPException(404, "Upload this persona's data first.")
 
     if req.backend == "colab":
+        persona_meta = json.loads((data_dir / "meta.json").read_text())
+        train_jsonl = (data_dir / "train.jsonl").read_text()
+        valid_jsonl = (data_dir / "valid.jsonl").read_text()
+        nb = colab_export.build_notebook(persona_meta["persona"], train_jsonl, valid_jsonl)
         nb_path = data_dir / f"{name}_colab.ipynb"
-        nb = colab_export.build_notebook(json.loads((data_dir / "meta.json").read_text())["persona"])
         nb_path.write_text(json.dumps(nb, indent=1))
         return {"backend": "colab", "notebook_url": f"/api/personas/{name}/colab_notebook"}
 
