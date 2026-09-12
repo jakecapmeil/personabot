@@ -6,11 +6,26 @@ Fine-tunes a small instruction-tuned LLM (LoRA) on one person's side of a chat
 export, then serves a chat window that talks back in their style — fully
 local, running on Apple Silicon via [MLX](https://github.com/ml-explore/mlx).
 
-## Setup
+## Requirements
+
+- **A Mac with Apple Silicon** (M1/M2/M3/M4). This is a hard requirement —
+  [MLX](https://github.com/ml-explore/mlx) only runs on Apple Silicon, so
+  Intel Macs, Windows, and Linux can't run the local training/chat path.
+- Python 3.10+ and [Homebrew](https://brew.sh) (for the `.txt` export step
+  below).
+- ~5-10GB free disk for a base model (4-bit quantized).
+
+## Get the code
 
 ```bash
+git clone https://github.com/jakecapmeil/personabot.git
+cd personabot
 pip install -r requirements.txt
 ```
+
+Nobody's chat data or trained personas are in this repo — `data/` and
+`models/adapters/` are gitignored. Each person who clones it uploads their
+own export and trains their own.
 
 ## Run
 
