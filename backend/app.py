@@ -197,12 +197,15 @@ def train_persona(name: str, req: TrainRequest):
 
     if req.backend == "colab":
         persona_meta = json.loads((data_dir / "meta.json").read_text())
-        train_jsonl = (data_dir / "train.jsonl").read_text()
-        valid_jsonl = (data_dir / "valid.jsonl").read_text()
-        nb = colab_export.build_notebook(persona_meta["persona"], train_jsonl, valid_jsonl)
+        nb = colab_export.build_notebook(persona_meta["persona"])
         nb_path = data_dir / f"{name}_colab.ipynb"
         nb_path.write_text(json.dumps(nb, indent=1))
-        return {"backend": "colab", "notebook_url": f"/api/personas/{name}/colab_notebook"}
+        return {
+            "backend": "colab",
+            "notebook_url": f"/api/personas/{name}/colab_notebook",
+            "train_jsonl_url": f"/api/personas/{name}/colab_train_jsonl",
+            "valid_jsonl_url": f"/api/personas/{name}/colab_valid_jsonl",
+        }
 
     meta = json.loads((data_dir / "meta.json").read_text())
     adapter_dir = ADAPTER_DIR / name
@@ -249,6 +252,26 @@ def download_notebook(name: str):
     if not path.exists():
         raise HTTPException(404, "No notebook generated yet — POST /train with backend=colab first.")
     return FileResponse(path, filename=path.name, media_type="application/x-ipynb+json")
+
+
+@app.get("/api/personas/{name}/colab_train_jsonl")
+def download_colab_train_jsonl(name: str):
+    """Served with the exact filename `train.jsonl` — the notebook's upload
+    cell checks for that literal name."""
+    name = _safe_name(name)
+    path = PROCESSED_DIR / name / "train.jsonl"
+    if not path.exists():
+        raise HTTPException(404, "Upload this persona's data first.")
+    return FileResponse(path, filename="train.jsonl", media_type="application/jsonl")
+
+
+@app.get("/api/personas/{name}/colab_valid_jsonl")
+def download_colab_valid_jsonl(name: str):
+    name = _safe_name(name)
+    path = PROCESSED_DIR / name / "valid.jsonl"
+    if not path.exists():
+        raise HTTPException(404, "Upload this persona's data first.")
+    return FileResponse(path, filename="valid.jsonl", media_type="application/jsonl")
 
 
 class ChatRequest(BaseModel):

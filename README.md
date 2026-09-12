@@ -122,31 +122,33 @@ your local Messages database directly; nothing leaves your machine.)
    anyone who can reach this Mac while personabot is running — no
    tunneling/public hosting is set up automatically) or a downloadable
    adapter `.zip` (portable to anyone else running personabot).
-6. **Cloud training (Colab + Unsloth)**: export a notebook with that
-   persona's prepared training data embedded in it, for a free-GPU
-   training run. It merges the LoRA into the base model before you
-   download it; `backend/import_colab.py` converts that merged model to
-   MLX locally (`mlx_lm.convert`) and registers it as a normal,
-   ready-to-chat persona — no adapter-format mismatch to resolve. See
-   below for the full walkthrough.
+6. **Cloud training (Colab + Unsloth)**: one click downloads the notebook
+   plus that persona's `train.jsonl`/`valid.jsonl`, for a free-GPU training
+   run. It merges the LoRA into the base model before you download it;
+   `backend/import_colab.py` converts that merged model to MLX locally
+   (`mlx_lm.convert`) and registers it as a normal, ready-to-chat persona —
+   no adapter-format mismatch to resolve. See below for the full
+   walkthrough.
 
 ## Cloud training (Colab)
 
 Faster than local (a free Colab GPU beats the M-series' unified-memory GPU
-for this), at the cost of leaving your Mac. Two steps:
+for this), at the cost of leaving your Mac.
 
 1. In the app, on an uploaded (not-yet-trained) persona, click
-   **Export Colab notebook** — downloads a `.ipynb` file with that
-   persona's `train.jsonl`/`valid.jsonl` baked into it (base64, in a code
-   cell), so there's nothing separate to upload once you're in Colab.
-   **This means the notebook file itself now contains their texts** —
-   nothing leaves your machine until you upload it to Colab in the next
-   step, same as before, but don't casually share this `.ipynb` around;
-   treat it like the conversation export it was built from.
+   **Download for Colab** — downloads three files at once: the notebook,
+   `train.jsonl`, and `valid.jsonl` (an in-app popup walks through the rest
+   right after). The notebook is plain code with no chat data in it; the
+   two `.jsonl` files carry this person's texts, so treat those two like
+   the conversation export they came from. (An earlier version tried
+   embedding the data *inside* the notebook to cut this to one file —
+   reverted, because the resulting `.ipynb` got too large for Colab's own
+   notebook loader to open reliably on anything but a small corpus.)
 2. Go to [colab.research.google.com](https://colab.research.google.com) →
-   **File → Upload notebook** (or drag the downloaded `.ipynb` onto that
-   page), set **Runtime → Change runtime type → T4 GPU**, then run the
-   cells in order.
+   **File → Upload notebook** → pick the downloaded `.ipynb`, set
+   **Runtime → Change runtime type → T4 GPU**, then run the cells in
+   order. The upload cell asks for two files — select **both**
+   `train.jsonl` and `valid.jsonl` together from your Downloads folder.
 
 Training runs in Colab. The last data-producing cell merges the LoRA into
 the base model and **downloads `merged_model.zip`** back to your Mac (your

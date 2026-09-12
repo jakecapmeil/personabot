@@ -124,6 +124,39 @@
     </div>
   </div>
 
+  <!-- Colab instructions sheet -->
+  <div id="colab-overlay" class="overlay hidden">
+    <div class="sheet">
+      <div class="sheet-header">
+        <span class="sheet-title">Training on Colab</span>
+        <button class="icon-button" data-action="close-colab">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M18 6 6 18"/><path d="M6 6l12 12"/></svg>
+        </button>
+      </div>
+      <div class="sheet-body help-body">
+        <p>Three files just downloaded: the notebook plus
+          <code>train.jsonl</code> / <code>valid.jsonl</code>. From here:</p>
+        <ol>
+          <li>Go to <a href="https://colab.research.google.com" target="_blank" rel="noopener">colab.research.google.com</a>
+            → <b>File → Upload notebook</b> → pick the <code>.ipynb</code> you
+            just downloaded.</li>
+          <li><b>Runtime → Change runtime type → T4 GPU</b>.</li>
+          <li>Run the cells in order. The upload cell asks for two files —
+            select <b>both</b> <code>train.jsonl</code> and
+            <code>valid.jsonl</code> together from your Downloads folder.</li>
+          <li>When it finishes, the last cell downloads
+            <code>merged_model.zip</code> back to this Mac.</li>
+          <li>Back here, use <b>Import trained model (.zip)</b> on this
+            persona's card (or run <code>import_colab.py</code> — see
+            README) with that file.</li>
+        </ol>
+        <p class="help-note">The notebook is plain code — no chat data in
+          it. Only <code>train.jsonl</code>/<code>valid.jsonl</code> carry
+          this person's texts.</p>
+      </div>
+    </div>
+  </div>
+
   <template id="icon-gear">
     <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
   </template>

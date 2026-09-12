@@ -117,6 +117,34 @@ $("#help-btn").addEventListener("click", () => $("#help-overlay").classList.remo
 $('[data-action="close-help"]').addEventListener("click", () => $("#help-overlay").classList.add("hidden"));
 $("#help-overlay").addEventListener("click", (e) => { if (e.target.id === "help-overlay") e.target.classList.add("hidden"); });
 
+// ==================== Colab instructions sheet ====================
+$('[data-action="close-colab"]').addEventListener("click", () => $("#colab-overlay").classList.add("hidden"));
+$("#colab-overlay").addEventListener("click", (e) => { if (e.target.id === "colab-overlay") e.target.classList.add("hidden"); });
+function openColabInstructions() {
+  $("#colab-overlay").classList.remove("hidden");
+}
+
+// Triggers a same-tab file download per URL via a throwaway <a download>
+// element — works for multiple sequential downloads without the popup
+// blocking that window.open() invites; a small stagger between each is
+// enough for the browser to treat them as separate user-initiated saves
+// rather than spam.
+function downloadFile(url) {
+  // url is already a full path like "/api/personas/<name>/colab_notebook".
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+}
+async function downloadSequentially(urls) {
+  for (const url of urls) {
+    downloadFile(url);
+    await new Promise((r) => setTimeout(r, 400));
+  }
+}
+
 // ==================== Settings sheet ====================
 const settingsOverlay = $("#settings-overlay");
 $('[data-action="close-settings"]').addEventListener("click", () => settingsOverlay.classList.add("hidden"));
@@ -275,7 +303,7 @@ function renderPersona(p) {
   if (p.state === "uploaded" || p.state === "error") {
     actions.innerHTML = `
       <button class="pill-button primary small" data-action="train-local">Train locally</button>
-      <button class="pill-button small" data-action="train-colab">Export Colab notebook</button>
+      <button class="pill-button small" data-action="train-colab">Download for Colab</button>
       <label class="pill-button small file-button" for="import-${p.name}">Import trained model (.zip)</label>
       <input id="import-${p.name}" data-role="import-file" type="file" accept=".zip" hidden />
     `;
@@ -381,7 +409,8 @@ function renderPersona(p) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ backend: "colab" }),
     });
-    window.open(API + res.notebook_url.replace("/api", ""), "_blank");
+    await downloadSequentially([res.notebook_url, res.train_jsonl_url, res.valid_jsonl_url]);
+    openColabInstructions(p);
   });
 
   div.querySelector('[data-action="chat"]')?.addEventListener("click", () => openChat(p));

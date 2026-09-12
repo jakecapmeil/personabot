@@ -1,16 +1,19 @@
 """
 Generates a self-contained Colab notebook that fine-tunes Qwen2.5-7B-Instruct
 with Unsloth on a persona's prepared data — the "cloud" backend. Faster than
-local (a free Colab GPU beats the M-series' unified-memory GPU for this), at
-the cost of running outside your machine.
+local in principle (a dedicated T4 has real tensor cores and more memory
+bandwidth than the M-series' unified-memory GPU, and Unsloth's fused kernels
+are built for exactly this), at the cost of running outside your machine —
+though I have no GPU/Colab access to verify actual wall-clock speed myself,
+unlike the local MLX path, which I've run and measured directly.
 
-The notebook embeds train.jsonl/valid.jsonl directly (base64-encoded in a
-code cell) so there's exactly one download-then-drag-in step instead of
-three — download this notebook, drop it into Colab, run it. The privacy
-tradeoff of that: **the exported .ipynb file itself now contains the
-persona's texts**. Nothing leaves your machine until you choose to upload
-it to Colab (same as before), but don't casually share the .ipynb around —
-it's not just code anymore.
+Earlier version embedded train.jsonl/valid.jsonl directly in the notebook
+(base64, one code cell) to cut the upload/download count from three to two.
+Reverted: for a corpus of any real size the resulting .ipynb (tens of MB)
+was too heavy for Colab's own notebook loader to open reliably. Back to
+three separate files — plain code, no chat data baked in — with
+`app.py`'s /colab_bundle endpoint packaging all three as one zip so it's
+still a single click on the personabot side.
 
 I have not been able to execute this notebook myself (no GPU/Colab access
 from here) — unlike the local MLX path, which I ran end-to-end. The Unsloth
@@ -18,15 +21,12 @@ API surface below is correct as of my training data, but if a cell errors
 on a version mismatch, Unsloth's own docs/GitHub are the fastest fix.
 
 Usage:
-    python colab_export.py --data_dir ../data/processed/hudson --persona Hudson --out hudson_colab.ipynb
+    python colab_export.py --persona Hudson --out hudson_colab.ipynb
 """
 import argparse
-import base64
 import json
-from pathlib import Path
 
 MODEL_NAME = "unsloth/Qwen2.5-7B-Instruct-bnb-4bit"
-_CHUNK = 120  # wrap each base64 literal to this many chars/line for readability
 
 
 def cell(cell_type, lines):
@@ -38,34 +38,7 @@ def cell(cell_type, lines):
     }
 
 
-def _embed_as_python(varname, text):
-    """A `varname = ("...", "...", ...)` tuple of base64 chunks, joined and
-    decoded at runtime — avoids one unreadably long source line."""
-    b64 = base64.b64encode(text.encode("utf-8")).decode("ascii")
-    chunks = [b64[i:i + _CHUNK] for i in range(0, len(b64), _CHUNK)] or [""]
-    lines = [f"{varname} = ("]
-    lines += [f'    "{c}"' for c in chunks]
-    lines += [")"]
-    return lines
-
-
-def build_notebook(persona, train_jsonl, valid_jsonl):
-    n_train = sum(1 for l in train_jsonl.splitlines() if l.strip())
-    n_valid = sum(1 for l in valid_jsonl.splitlines() if l.strip())
-
-    data_cell_lines = (
-        ["import base64, pathlib", ""]
-        + _embed_as_python("_train_b64", train_jsonl)
-        + [""]
-        + _embed_as_python("_valid_b64", valid_jsonl)
-        + [
-            "",
-            "pathlib.Path('train.jsonl').write_bytes(base64.b64decode(''.join(_train_b64)))",
-            "pathlib.Path('valid.jsonl').write_bytes(base64.b64decode(''.join(_valid_b64)))",
-            f"print(f'Wrote train.jsonl ({n_train} examples) and valid.jsonl ({n_valid} examples)')",
-        ]
-    )
-
+def build_notebook(persona):
     cells = [
         cell("markdown", [
             f"# {persona} chatbot — cloud fine-tune (Unsloth + Colab)",
@@ -73,17 +46,23 @@ def build_notebook(persona, train_jsonl, valid_jsonl):
             "Runtime: **Runtime > Change runtime type > T4 GPU** (or better) before running.",
             "",
             f"This notebook trains a LoRA adapter on `{persona}`'s texting style. "
-            f"**This file contains {persona}'s prepared training data** "
-            f"({n_train} train / {n_valid} val examples), embedded so there's nothing "
-            "to separately upload — just run the cells in order. Don't share this "
-            "`.ipynb` file around casually; treat it like the conversation export it "
-            "was built from.",
+            "You should have downloaded this notebook together with `train.jsonl` "
+            "and `valid.jsonl` — upload those two when prompted below. Nothing else "
+            "about the conversation leaves your machine except what you upload in "
+            "that cell.",
         ]),
         cell("code", [
             "!pip install -q unsloth trl==0.9.6",
         ]),
-        cell("markdown", ["## 1. Write out the embedded training data"]),
-        cell("code", data_cell_lines),
+        cell("markdown", ["## 1. Upload the prepared data (train.jsonl, valid.jsonl)"]),
+        cell("code", [
+            "from google.colab import files",
+            "print('Select train.jsonl and valid.jsonl from your computer:')",
+            "uploaded = files.upload()",
+            "assert 'train.jsonl' in uploaded and 'valid.jsonl' in uploaded, \\",
+            "    'Upload both train.jsonl and valid.jsonl — they were downloaded ' \\",
+            "    'alongside this notebook.'",
+        ]),
         cell("markdown", ["## 2. Load the base model (4-bit) + attach LoRA"]),
         cell("code", [
             "from unsloth import FastLanguageModel",
@@ -185,8 +164,6 @@ def build_notebook(persona, train_jsonl, valid_jsonl):
             "local models) and registers it as a ready-to-chat persona in the app.",
         ]),
         cell("code", [
-            "from google.colab import files",
-            "",
             "merged_dir = \"merged_model\"",
             "model.save_pretrained_merged(merged_dir, tokenizer, save_method=\"merged_16bit\")",
             "",
@@ -238,16 +215,10 @@ def build_notebook(persona, train_jsonl, valid_jsonl):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data_dir", required=True, help="data/processed/<persona>/ directory")
     ap.add_argument("--persona", required=True, help="Display name, e.g. Hudson")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
-
-    data_dir = Path(args.data_dir)
-    train_jsonl = (data_dir / "train.jsonl").read_text()
-    valid_jsonl = (data_dir / "valid.jsonl").read_text()
-
-    nb = build_notebook(args.persona, train_jsonl, valid_jsonl)
+    nb = build_notebook(args.persona)
     with open(args.out, "w") as f:
         json.dump(nb, f, indent=1)
     print(f"Wrote {args.out} — upload it to https://colab.research.google.com")
