@@ -461,5 +461,6 @@ input[type="range"] {
 }
 .help-body code { background: var(--panel-2); padding: 1px 5px; border-radius: 4px; font-family: ui-monospace, monospace; font-size: 0.85em; }
 .help-note { color: var(--muted); font-size: 0.85rem; }
+.help-warning { font-size: 0.9rem; margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--divider); }
 
 .share-note { font-size: 0.72rem; color: var(--muted); margin: 4px 0 0; }

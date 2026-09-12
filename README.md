@@ -34,11 +34,25 @@ For an iMessage conversation on a Mac:
 3. Export every conversation as text:
    `imessage-exporter -f txt -o ~/Desktop/exported-messages`
 4. Open that folder — one `.txt` per conversation, named by phone
-   number/email/contact. Find the one for this person.
+   number/email/contact. Find the one for this person — **check for more
+   than one file for them** (see below).
 5. Upload *that* file in the app.
 
 Already-formatted transcripts work too — any `Me: …` / `Name: …` per-line
 text file.
+
+**Got fewer messages than expected?** The exporter can only read what's
+actually on this Mac — two separate, common causes:
+
+1. **Not fully synced.** In Messages → Settings → iMessage, turn on
+   **Messages in iCloud** and set **Keep Messages** to **Forever**, then
+   give it time to finish syncing (can take a while for a long history)
+   before re-exporting.
+2. **Split across threads.** iMessage starts a *separate conversation per
+   handle* — a different phone number, a changed number, or an email
+   address each create their own thread with the same person. Look for
+   more than one exported file matching them and merge before uploading:
+   `cat person-number.txt person-email.txt > combined.txt`
 
 ([imessage-exporter](https://github.com/ReagentX/imessage-exporter) reads
 your local Messages database directly; nothing leaves your machine.)

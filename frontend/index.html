@@ -96,11 +96,30 @@
             <pre>imessage-exporter -f txt -o ~/Desktop/exported-messages</pre>
           </li>
           <li>Open that folder — one <code>.txt</code> per conversation, named
-            by phone number/email/contact. Find the one for this person.</li>
+            by phone number/email/contact. Find the one for this person —
+            <b>check for more than one file for them</b> (see below).</li>
           <li>Upload <i>that</i> file above.</li>
         </ol>
         <p class="help-note">Already-formatted transcripts work too — any
           <code>Me: …</code> / <code>Name: …</code> per-line text file.</p>
+
+        <p class="help-warning"><b>Got fewer messages than expected?</b>
+          The exporter can only read what's actually on this Mac — two
+          separate causes, both common:</p>
+        <ol>
+          <li><b>Not fully synced.</b> In Messages → Settings → iMessage,
+            turn on <b>Messages in iCloud</b> and set
+            <b>Keep Messages</b> to <b>Forever</b>, then give it time to
+            finish syncing (it can take a while for a long history) before
+            re-exporting.</li>
+          <li><b>Split across threads.</b> iMessage starts a
+            <i>separate conversation per handle</i> — a different phone
+            number, a changed number, or an email address all create their
+            own thread with the same person. Look for more than one
+            exported file matching them and merge before uploading:
+            <pre>cat person-number.txt person-email.txt > combined.txt</pre>
+          </li>
+        </ol>
       </div>
     </div>
   </div>
