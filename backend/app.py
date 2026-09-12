@@ -37,6 +37,18 @@ app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
 )
 
+
+@app.middleware("http")
+async def no_cache_frontend(request, call_next):
+    """This is an actively-edited local app, not a CDN-fronted site — a
+    browser silently serving a stale style.css/app.js after an edit (which
+    happened mid-session and looked exactly like a real UI bug) is a worse
+    default than always refetching."""
+    response = await call_next(request)
+    if request.url.path in ("/", "/style.css", "/app.js") or request.url.path.startswith("/p/"):
+        response.headers["Cache-Control"] = "no-store"
+    return response
+
 NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
 
 # In-memory training job state: {name: {"state": ..., "log": [...], "error": ...}}
