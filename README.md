@@ -128,6 +128,37 @@ your local Messages database directly; nothing leaves your machine.)
    the base model before you download it; `backend/import_colab.py` converts
    that merged model to MLX locally (`mlx_lm.convert`) and registers it as a
    normal, ready-to-chat persona — no adapter-format mismatch to resolve.
+   See below for the full walkthrough.
+
+## Cloud training (Colab)
+
+Faster than local (a free Colab GPU beats the M-series' unified-memory GPU
+for this), at the cost of leaving your Mac. There are **three separate
+upload/download moments**, not one — worth knowing going in:
+
+1. In the app, on an uploaded (not-yet-trained) persona, click
+   **Export Colab notebook**. This *downloads a `.ipynb` file* to your
+   Mac — it doesn't open Colab itself.
+2. Go to [colab.research.google.com](https://colab.research.google.com) →
+   **File → Upload notebook** (or drag the downloaded `.ipynb` onto that
+   page). This is the "drag it in" part, and it's just the notebook itself
+   — no chat data in it yet.
+3. **Runtime → Change runtime type → T4 GPU**, then run the cells in
+   order. The second cell pops a file-upload widget *inside the notebook*
+   — that's where you drag in `train.jsonl` and `valid.jsonl` from
+   `data/processed/<persona>/` on your Mac. This is the only point your
+   data leaves your machine.
+4. Training runs in Colab. The last data-producing cell merges the LoRA
+   into the base model and **downloads `merged_model.zip`** back to your
+   Mac (your Downloads folder) — a full model, not a bare adapter, so
+   there's no HF/PEFT-vs-MLX format mismatch to fight later.
+5. Back on your Mac, either use the **Import trained model (.zip)** file
+   picker on that persona's card in the app, or run:
+   ```bash
+   python3 backend/import_colab.py --name <persona-name> --zip ~/Downloads/merged_model.zip
+   ```
+   This converts it to MLX format locally and the persona shows up ready
+   to chat, same as a locally-trained one.
 
 ## Notes on scale
 
